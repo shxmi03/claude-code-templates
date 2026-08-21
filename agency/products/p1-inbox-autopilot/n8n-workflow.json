@@ -1,0 +1,172 @@
+{
+  "name": "P1 — Inbox Autopilot (nacrt odgovora na upit gosta)",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "is:unread -from:me -label:autopilot-done newer_than:2d"
+        },
+        "options": {}
+      },
+      "id": "trigger-gmail",
+      "name": "Novi upit (Gmail)",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [-200, 300],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Izvuce cist tekst upita i posiljatelja iz Gmail poruke.\n// PROPERTY_CONTEXT se popunjava po klijentu prilikom postavljanja.\n\nconst PROPERTY_CONTEXT = `\nOBJEKT: {{POPUNITI — naziv, lokacija, broj jedinica}}\nJEDINICE: {{POPUNITI — npr. A1 (2+2, 55m2), A2 (4+2, 80m2)}}\nCIJENE 2026: {{POPUNITI — po sezoni i jedinici}}\nMINIMALNI BORAVAK: {{POPUNITI}}\nCHECK-IN / CHECK-OUT: {{POPUNITI}}\nUKLJUCENO: {{POPUNITI — parking, klima, wifi, posteljina}}\nNIJE UKLJUCENO: {{POPUNITI — boravisna pristojba, cisenje}}\nTON: {{POPUNITI — npr. srdacan, kratak, bez usklicnika}}\n`;\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const msg = item.json;\n\n  const headers = msg.payload?.headers || [];\n  const header = (name) =>\n    headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value || '';\n\n  const body =\n    msg.text ||\n    msg.snippet ||\n    '';\n\n  out.push({\n    json: {\n      messageId: msg.id,\n      threadId: msg.threadId,\n      from: header('From'),\n      subject: header('Subject'),\n      receivedAt: new Date(Number(msg.internalDate || Date.now())).toISOString(),\n      inquiryText: body.slice(0, 6000),\n      propertyContext: PROPERTY_CONTEXT,\n    },\n  });\n}\n\nreturn out;"
+      },
+      "id": "prep",
+      "name": "Pripremi kontekst",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [20, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.ANTHROPIC_API_KEY }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'claude-opus-5',\n  max_tokens: 4000,\n  thinking: { type: 'adaptive' },\n  output_config: { effort: 'medium' },\n  system: 'Ti si asistent vlasnika turistickog smjestaja. Iz dolaznog upita gosta izvuci podatke i napisi NACRT odgovora.\\n\\nPRAVILA:\\n- Odgovori na JEZIKU KOJIM JE GOST PISAO.\\n- Koristi ISKLJUCIVO cijene i podatke iz konteksta objekta. Ako podatak nedostaje, u nacrt stavi [PROVJERITI: sto nedostaje] umjesto da izmislis.\\n- Nikad ne potvrduj dostupnost kao sigurnu; napisi da je rezervacija potvrdena tek nakon potvrde vlasnika.\\n- Ako poruka NIJE upit za smjestaj (newsletter, racun, spam), postavi is_inquiry na false i ostavi draft prazan.\\n\\nOdgovori ISKLJUCIVO validnim JSON objektom, bez markdown ograda, s tocno ovim kljucevima:\\n{\"is_inquiry\": boolean, \"language\": string, \"guest_name\": string, \"check_in\": string, \"check_out\": string, \"guests\": string, \"unit_requested\": string, \"missing_info\": [string], \"draft_subject\": string, \"draft_body\": string}',\n  messages: [\n    {\n      role: 'user',\n      content: 'KONTEKST OBJEKTA:\\n' + $json.propertyContext + '\\n\\n---\\n\\nDOLAZNI UPIT\\nOd: ' + $json.from + '\\nPredmet: ' + $json.subject + '\\n\\n' + $json.inquiryText\n    }\n  ]\n}) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "claude",
+      "name": "Claude — analiza i nacrt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parsira Claudeov JSON odgovor. Nikad ne radi string-matching na\n// serijaliziranom inputu — uvijek JSON.parse (escaping se razlikuje).\n\nconst out = [];\n\nfor (let i = 0; i < $input.all().length; i++) {\n  const res = $input.all()[i].json;\n  const src = $('Pripremi kontekst').all()[i].json;\n\n  if (res.stop_reason === 'refusal') {\n    out.push({ json: { ...src, is_inquiry: false, error: 'refusal', skip: true } });\n    continue;\n  }\n\n  const textBlock = (res.content || []).find((b) => b.type === 'text');\n  if (!textBlock) {\n    out.push({ json: { ...src, is_inquiry: false, error: 'no_text_block', skip: true } });\n    continue;\n  }\n\n  let parsed;\n  try {\n    parsed = JSON.parse(textBlock.text.trim().replace(/^```(?:json)?|```$/g, '').trim());\n  } catch (e) {\n    out.push({ json: { ...src, is_inquiry: false, error: 'parse_failed', raw: textBlock.text, skip: true } });\n    continue;\n  }\n\n  out.push({\n    json: {\n      ...src,\n      ...parsed,\n      skip: parsed.is_inquiry !== true,\n      usage: res.usage || {},\n    },\n  });\n}\n\n// Propusti dalje samo stvarne upite.\nreturn out.filter((o) => !o.json.skip);"
+      },
+      "id": "parse",
+      "name": "Parsiraj odgovor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "operation": "create",
+        "subject": "={{ $json.draft_subject }}",
+        "emailType": "text",
+        "message": "={{ $json.draft_body }}",
+        "options": {
+          "sendTo": "={{ $json.from }}",
+          "threadId": "={{ $json.threadId }}"
+        }
+      },
+      "id": "draft",
+      "name": "Spremi nacrt u Drafts",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [680, 200],
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "={{ $env.AIRTABLE_BASE_ID }}",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "Upiti",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Gost": "={{ $json.guest_name }}",
+            "Email": "={{ $json.from }}",
+            "Jezik": "={{ $json.language }}",
+            "Dolazak": "={{ $json.check_in }}",
+            "Odlazak": "={{ $json.check_out }}",
+            "Osoba": "={{ $json.guests }}",
+            "Jedinica": "={{ $json.unit_requested }}",
+            "Nedostaje": "={{ ($json.missing_info || []).join(', ') }}",
+            "Zaprimljeno": "={{ $json.receivedAt }}",
+            "Status": "Nacrt spreman"
+          }
+        },
+        "options": {}
+      },
+      "id": "airtable",
+      "name": "Logiraj upit (Airtable)",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [680, 400],
+      "credentials": {
+        "airtableTokenApi": {
+          "name": "Airtable account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Novi upit (Gmail)": {
+      "main": [[{ "node": "Pripremi kontekst", "type": "main", "index": 0 }]]
+    },
+    "Pripremi kontekst": {
+      "main": [[{ "node": "Claude — analiza i nacrt", "type": "main", "index": 0 }]]
+    },
+    "Claude — analiza i nacrt": {
+      "main": [[{ "node": "Parsiraj odgovor", "type": "main", "index": 0 }]]
+    },
+    "Parsiraj odgovor": {
+      "main": [
+        [
+          { "node": "Spremi nacrt u Drafts", "type": "main", "index": 0 },
+          { "node": "Logiraj upit (Airtable)", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
