@@ -4,7 +4,26 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-Node.js CLI tool for managing Claude Code components (agents, commands, MCPs, hooks, settings) with a static website for browsing and installing components. The dashboard and its API routes are deployed on Cloudflare Pages, with supporting cron and monitoring tasks running as Cloudflare Workers.
+Node.js CLI tool for managing Claude Code components (agents, commands, MCPs, hooks, settings) with a static website for browsing and installing components. The dashboard and its API routes are deployed on Cloudflare Pages, with supporting cron and monitoring tasks running as Cloudflare Workers. A Rust rewrite of the CLI's core install path (`cli-rust/`) is shipping in parallel as a separate, opt-in binary — see [Rust CLI](#rust-cli-cli-rust) below.
+
+This repository (`shxmi03/claude-code-templates`) is a fork of the upstream
+`davila7/claude-code-templates`. `AGENCY.md` at the repo root is a
+fork-specific, Croatian-language curated list of components for an AI
+automation agency use case — it documents a subset of the upstream catalog,
+it does not describe a separate codebase. Treat upstream instructions in this
+file as still authoritative for how the code works; `AGENCY.md` is reference
+material, not a build target.
+
+### Scoped Claude Code rules
+
+`.claude/rules/*.md` files carry path-scoped instructions that Claude Code
+loads automatically when working in matching paths, layered on top of this
+file — check them for area-specific detail before assuming this file is the
+only source of guidance:
+
+- `.claude/rules/cli-tool.md` — scoped to `cli-tool/**`, `src/**`
+- `.claude/rules/dashboard.md` — scoped to `dashboard/**`
+- `.claude/rules/cloudflare.md` — scoped to `cloudflare-workers/**`
 
 ## Essential Commands
 
@@ -63,6 +82,12 @@ const API_KEY = process.env.GOOGLE_API_KEY;
 **Hooks** (39+) - Automation triggers
 **Loops** (18+) - Autonomous agentic workflows (goal + interval + stop condition) that reference other components
 **Templates** (14+) - Complete project configurations
+**Skills** - Recursive skill trees installed via the GitHub contents API (see Skill Security Scanning below); live in `cli-tool/components/skills/`
+
+`.claude-plugin/` holds this repo's own Claude Code plugin manifest (e.g.
+`.claude-plugin/skills/owasp-security/`) — a skill packaged so this repository
+itself can be installed/consumed as a plugin, separate from the component
+catalog under `cli-tool/components/`.
 
 ### Installation Patterns
 
@@ -207,6 +232,39 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 - Always remove the token from npm config after publishing (`npm config delete`)
 - The local `package.json` version may drift from npm if published from CI — always check `npm view claude-code-templates version` first
 - Never hardcode or commit tokens
+
+## Rust CLI (`cli-rust/`)
+
+A Rust port of just the **install core** of the CLI (`--agent`, `--command`,
+`--mcp`, `--setting`, `--hook`, `--skill`), verified at byte-for-byte parity
+with the Node CLI. Everything else (dashboard, sandbox, global agents, stats,
+health-check, interactive setup) is delegated to the Node CLI — non-install
+flags forward verbatim to `npx -y claude-code-templates@latest <args>` (or
+`CCT_NODE_BIN` for local testing against `cli-tool/bin/create-claude-config.js`).
+
+- Ships as a **separate** binary (`cct`), distributed via GitHub Releases
+  tagged `cli-rust-v*`, cargo-binstall, and `cargo install --path cli-rust` —
+  it does **not** replace or touch the `claude-code-templates` npm package.
+- `src/commands/install.rs` mirrors `installIndividual*`/`installMultipleComponents`
+  from `src/index.js`; `src/merge.rs` reimplements `.mcp.json`/settings/hooks
+  merge semantics (2-space JSON with trailing newline, `shift_remove` ordering,
+  `permissions.{allow,deny,ask}` Set-union, hook array concatenation) — keep
+  these in sync with the Node implementation when either changes.
+- Built/released by `.github/workflows/build-rust-cli.yml` and
+  `.github/workflows/rust-ci.yml`.
+
+```bash
+cd cli-rust
+cargo build                 # debug build
+cargo test                  # unit tests (merge semantics)
+cargo build --release       # optimized binary at target/release/cct
+
+# Parity check vs Node (see cli-rust/README.md for the full script)
+CCT_NODE_BIN=../cli-tool/bin/create-claude-config.js cct --list-agents
+```
+
+See `cli-rust/README.md` for the full architecture map, release process, and
+planned distribution channels (Homebrew tap, `npx @davila7/cct`).
 
 ## API Architecture
 
@@ -502,6 +560,15 @@ All of the above are served as static Cloudflare Pages assets with
 - For each marketplace it records `plugins_list[].components` (counts per type) and `plugins_list[].components_items` (`{name, description}` per command/agent/skill/hook/mcp/lsp, description parsed from the item's frontmatter). The dashboard's `/plugins/[slug].astro` page renders this through `MarketplacePluginsList.tsx`, which shows a search box and a "view details" modal per plugin.
 - **`max_local_scans = 50`** in `extract_marketplace_plugins_detail()` caps how many *locally-sourced* plugins (i.e. `source: "./plugins/..."` within the marketplace's own repo) get scanned for real component names/descriptions, per marketplace, to bound GitHub API calls. Plugins beyond that cap (or plugins hosted in an external repo, which are never scanned) fall back to showing only tag badges in the modal, with no itemized breakdown — this is a graceful degradation, not an error.
   - As of 2026-07-11, `anthropics/claude-plugins-official` alone has 51 locally-sourced plugins (out of 255 total), i.e. already at the edge of this cap. Bump `max_local_scans` if more complete coverage is needed — GitHub's rate limit (5000 req/hour authenticated) is not the constraint, wall-clock run time is (each item now costs 1 extra API call to fetch its file content for the description).
+
+### Database Migrations (`database/migrations/`)
+
+Raw SQL migrations for the Neon Postgres database (see `NEON_DATABASE_URL`
+under [Environment Variables](#environment-variables-cloudflare)). Applied
+manually — there is no migration runner wired into CI. Numbered, sequential
+(`001_...sql`, `002_...sql`); add new migrations with the next number rather
+than editing an applied one. Covers `claude_code_versions`/`claude_code_changes`
+(used by `/api/claude-code-check`) and `command_usage_logs`.
 
 ### Legacy Static Site (docs/)
 
